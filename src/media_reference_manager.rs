@@ -1,13 +1,12 @@
+use crate::media_tokens::DownloadTokenParams;
 use crate::{database, AppState};
+use bb8_postgres::bb8::PooledConnection;
+use bb8_postgres::PostgresConnectionManager;
 use regex::Regex;
 use std::collections::HashSet;
 use std::sync::Arc;
-
-use bb8_postgres::bb8::PooledConnection;
-use bb8_postgres::PostgresConnectionManager;
 use tokio_postgres::Error as PgError;
-
-use crate::media_tokens::DownloadTokenParams;
+use tracing::error;
 
 type SharedConn = PooledConnection<'static, PostgresConnectionManager<tokio_postgres::NoTls>>;
 
@@ -153,7 +152,7 @@ pub async fn update_media_references_note_state(
     let mut client: SharedConn = match state.db_pool.get_owned().await {
         Ok(pool) => pool,
         Err(err) => {
-            tracing::error!(error = %err, note_id = note_id, "Failed to get database pool for media reference update");
+            error!(error = %err, note_id = note_id, "Failed to get database pool for media reference update");
             return Err("Internal Error".into());
         }
     };
@@ -169,7 +168,7 @@ pub async fn update_media_references_for_approved_note(
     let mut client: SharedConn = match state.db_pool.get_owned().await {
         Ok(pool) => pool,
         Err(err) => {
-            tracing::error!(error = %err, note_id = note_id, "Failed to get database pool for approved note");
+            error!(error = %err, note_id = note_id, "Failed to get database pool for approved note");
             return Err("Internal Error".into());
         }
     };
@@ -212,7 +211,7 @@ pub async fn update_media_references_for_commit(
     let mut client: SharedConn = match state.db_pool.get_owned().await {
         Ok(pool) => pool,
         Err(err) => {
-            tracing::error!(error = %err, "Failed to get database pool for commit media references");
+            error!(error = %err, "Failed to get database pool for commit media references");
             return Err("Internal Error".into());
         }
     };
@@ -234,7 +233,7 @@ pub async fn get_presigned_url(
     let client: SharedConn = match state.db_pool.get_owned().await {
         Ok(pool) => pool,
         Err(err) => {
-            tracing::error!(error = %err, note_id = note_id, "Failed to get database pool for presigned URL");
+            error!(error = %err, note_id = note_id, "Failed to get database pool for presigned URL");
             return Err("Internal Error".into());
         }
     };

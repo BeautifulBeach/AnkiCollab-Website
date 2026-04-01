@@ -21,19 +21,7 @@ pub mod user;
 
 use crate::error::Error;
 use crate::error::NoteNotFoundContext;
-use database::owned_deck_id;
-use database::AppState;
-use net::SocketAddr;
-use sync::Arc;
-use tokio::signal;
-use tower::ServiceBuilder;
-use user::{Auth, ChangePasswordRequest, Credentials, User, purge_deleted_account_data};
-
-use axum_client_ip::{ClientIp, ClientIpSource};
-use tower_http::services::ServeDir;
-use tower_http::trace::TraceLayer;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
+use aws_sdk_s3::Client as S3Client;
 use axum::{
     extract::{Path, Query, State},
     http::{header, HeaderValue},
@@ -42,37 +30,45 @@ use axum::{
     routing::{get, post},
     Extension, Json, Router,
 };
-
+use axum_client_ip::{ClientIp, ClientIpSource};
+use database::owned_deck_id;
+use database::AppState;
+use net::SocketAddr;
+use serde::{Deserialize, Serialize};
+use std::result::Result;
+use std::{
+    cfg, env, eprintln, format, net, option_env, panic, str, sync,
+    unreachable, vec,
+};
 use structs::{
     BasicDeckInfo, DeckHash, DeckId, DeckOverview, FieldId, NoteId, Return, UpdateNotetype,
     UpdateNotetypeTemplate, UserId,
 };
 use structs::{
-    SubscriptionPolicyGetResponse, SubscriptionPolicyItem, SubscriptionPolicyPostRequest,
-};
-use structs::{
-    BulkNoteActionRequest, BulkNoteActionResponse, BulkNoteActionFailure,
+    BulkNoteActionFailure, BulkNoteActionRequest, BulkNoteActionResponse,
 };
 use structs::{
     CommitDecisionRequest, NotificationHistoryResponse, NotificationMarkReadRequest,
     NotificationMarkReadResponse, NotificationUnreadResponse,
 };
-use tera::Tera;
-
-use aws_sdk_s3::Client as S3Client;
-use std::result::Result;
-use std::{
-    cfg, env, eprintln, format, i32, i64, net, option_env, panic, str, sync, u32,
-    unreachable, usize, vec,
+use structs::{
+    SubscriptionPolicyGetResponse, SubscriptionPolicyItem, SubscriptionPolicyPostRequest,
 };
-use serde::{Deserialize, Serialize};
+use sync::Arc;
+use tera::Tera;
+use tokio::signal;
+use tower::ServiceBuilder;
+use tower_http::services::ServeDir;
+use tower_http::trace::TraceLayer;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use user::{purge_deleted_account_data, Auth, ChangePasswordRequest, Credentials, User};
 
 type SharedConn = bb8_postgres::bb8::PooledConnection<'static, bb8_postgres::PostgresConnectionManager<tokio_postgres::NoTls>>;
 
 fn check_login(user: Option<User>) -> Result<User, Error> {
     match user {
         Some(user) => Ok(user),
-        None => Err(error::Error::Redirect("/login".to_string())),
+        None => Err(Error::Redirect("/login".to_string())),
     }
 }
 
@@ -92,10 +88,10 @@ async fn post_login(
 ) -> Result<impl IntoResponse, Error> {
     let res = auth.login(form, ip).await?;
 
-    let mut response = axum::response::Redirect::to("/").into_response();
+    let mut response = Redirect::to("/").into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
-        header::HeaderValue::from_str(&res).unwrap(),
+        HeaderValue::from_str(&res).unwrap(),
     );
 
     Ok(response)
@@ -166,15 +162,15 @@ async fn accessibility_page(State(appstate): State<Arc<AppState>>) -> Result<imp
 
 async fn logout(Extension(auth): Extension<Arc<Auth>>) -> Result<impl IntoResponse, Error> {
     let exp_cookie = auth.logout().await;
-    let mut response = axum::response::Redirect::to("/").into_response();
+    let mut response = Redirect::to("/").into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
-        header::HeaderValue::from_str(&exp_cookie).unwrap(),
+        HeaderValue::from_str(&exp_cookie).unwrap(),
     );
     // add a Clear-Site-Data header for complete cleanup
     response.headers_mut().insert(
         header::HeaderName::from_static("clear-site-data"),
-        header::HeaderValue::from_static("\"cookies\""),
+        HeaderValue::from_static("\"cookies\""),
     );
 
     Ok(response)
@@ -209,14 +205,14 @@ async fn post_change_password(
 
     // Log the user out so they need to re-authenticate with new password
     let exp_cookie = auth.logout().await;
-    let mut response = axum::response::Redirect::to("/login").into_response();
+    let mut response = Redirect::to("/login").into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
-        header::HeaderValue::from_str(&exp_cookie).unwrap(),
+        HeaderValue::from_str(&exp_cookie).unwrap(),
     );
     response.headers_mut().insert(
         header::HeaderName::from_static("clear-site-data"),
-        header::HeaderValue::from_static("\"cookies\""),
+        HeaderValue::from_static("\"cookies\""),
     );
 
     Ok(response)
@@ -241,21 +237,21 @@ async fn delete_account(
                 purge_deleted_account_data(&conn, user_id, &username).await;
             }
             Err(e) => {
-                tracing::error!(user_id, error = %e, "Failed to get DB connection for account purge");
+                error!(user_id, error = %e, "Failed to get DB connection for account purge");
             }
         }
     });
 
     // Log the user out immediately
     let exp_cookie = auth.logout().await;
-    let mut response = axum::response::Redirect::to("/").into_response();
+    let mut response = Redirect::to("/").into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
-        header::HeaderValue::from_str(&exp_cookie).unwrap(),
+        HeaderValue::from_str(&exp_cookie).unwrap(),
     );
     response.headers_mut().insert(
         header::HeaderName::from_static("clear-site-data"),
-        header::HeaderValue::from_static("\"cookies\""),
+        HeaderValue::from_static("\"cookies\""),
     );
 
     Ok(response)
@@ -271,7 +267,7 @@ async fn render_optional_tags(
     let tags = match optional_tags_manager::get_tags(appstate, deck_id).await {
         Ok(tags) => tags,
         Err(e) => {
-            tracing::warn!(error = %e, deck_id = deck_id, "Failed to retrieve optional tags");
+            warn!(error = %e, deck_id = deck_id, "Failed to retrieve optional tags");
             return Ok(Html(
                 "Error retrieving optional tags. Please notify us.".to_string(),
             ));
@@ -328,7 +324,7 @@ async fn render_maintainers(
     let maintainers = match maintainer_manager::get_maintainers(appstate, deck_id).await {
         Ok(maintainers) => maintainers,
         Err(e) => {
-            tracing::warn!(error = %e, deck_id = deck_id, "Failed to get maintainers");
+            warn!(error = %e, deck_id = deck_id, "Failed to get maintainers");
             return Html("Error getting maintainers.".to_string());
         }
     };
@@ -416,7 +412,7 @@ async fn edit_notetype(
         .await
         .expect("Error preparing edit notetype statement");
     if owned_info.is_empty() {
-        return error_page(&appstate, error::Error::Unauthorized.to_string()).await;
+        return error_page(&appstate, Error::Unauthorized.to_string()).await;
     }
 
     let notetype_info = client
@@ -496,7 +492,7 @@ async fn edit_deck(
     let mut context = tera::Context::new();
 
     if owner != user.id() {
-        return error_page(&appstate, error::Error::Unauthorized.to_string()).await;
+        return error_page(&appstate, Error::Unauthorized.to_string()).await;
     }
 
     let desc: String = owned_info[0].get(1);
@@ -596,8 +592,8 @@ async fn delete_deck(
     let client: SharedConn = match db_state_clone.db_pool.get_owned().await {
             Ok(pool) => pool,
             Err(err) => {
-                tracing::error!(error = %err, "Failed to get database connection pool");
-                return Err(error::Error::DatabaseConnection);
+                error!(error = %err, "Failed to get database connection pool");
+                return Err(Error::DatabaseConnection);
             }
         };
     let _ = owned_deck_id(&appstate, &deck_hash, user.id()).await?; // only for checking if user owns the deck
@@ -610,13 +606,13 @@ async fn delete_deck(
     // Run on the Tokio runtime
     tokio::spawn(async move {
         if let Err(e) = purge_s3_deck_assets(&db_state_clone, &deck_hash).await {
-            tracing::warn!(error = %e, deck_hash = %deck_hash, "Failed to purge S3 assets for deck");
+            warn!(error = %e, deck_hash = %deck_hash, "Failed to purge S3 assets for deck");
         }
 
         let client: SharedConn = match db_state_clone.db_pool.get_owned().await {
             Ok(pool) => pool,
             Err(err) => {
-                tracing::error!(error = %err, "Failed to get database pool in background task");
+                error!(error = %err, "Failed to get database pool in background task");
                 return;
             }
         };
@@ -629,7 +625,7 @@ async fn delete_deck(
             .await.unwrap();
 
         if let Err(err) = purge_s3_deck_assets(&appstate, &deck_hash).await {
-            tracing::warn!(
+            warn!(
                 error = %err,
                 deck_hash = %deck_hash,
                 "Failed to delete S3 assets for deck"
@@ -684,7 +680,7 @@ async fn purge_s3_deck_assets(
         if response.is_truncated().unwrap_or(false) {
             continuation_token = response
                 .next_continuation_token()
-                .map(std::borrow::ToOwned::to_owned);
+                .map(ToOwned::to_owned);
         } else {
             break;
         }
@@ -761,7 +757,7 @@ async fn deny_commit(
             }
         }
         Err(error) => {
-            tracing::warn!(error = %error, commit_id = commit_id, "Failed to deny commit");
+            warn!(error = %error, commit_id = commit_id, "Failed to deny commit");
             Err(error)
         }
     }
@@ -962,7 +958,7 @@ async fn review_commit(
         )
         .await?;
     if q_guid.is_empty() {
-        return error_page(&appstate, error::Error::CommitNotFound.to_string())
+        return error_page(&appstate, Error::CommitNotFound.to_string())
             .await
             .map(IntoResponse::into_response);
     }
@@ -1033,7 +1029,7 @@ async fn review_note(
         Err(_error) => {
             return error_page(
                 &appstate,
-                error::Error::NoteNotFound(NoteNotFoundContext::InvalidData).to_string(),
+                Error::NoteNotFound(NoteNotFoundContext::InvalidData).to_string(),
             )
             .await
             .map(|h| h.into_response());
@@ -1044,7 +1040,7 @@ async fn review_note(
         // Invalid data // No note found!
         return error_page(
             &appstate,
-            error::Error::NoteNotFound(NoteNotFoundContext::InvalidData).to_string(),
+            Error::NoteNotFound(NoteNotFoundContext::InvalidData).to_string(),
         )
         .await
         .map(|h| h.into_response());
@@ -1061,7 +1057,7 @@ async fn review_note(
     if q_guid.is_empty() {
         return error_page(
             &appstate,
-            error::Error::NoteNotFound(NoteNotFoundContext::InvalidData).to_string(),
+            Error::NoteNotFound(NoteNotFoundContext::InvalidData).to_string(),
         )
         .await
         .map(|h| h.into_response());
@@ -1098,7 +1094,7 @@ async fn note_history_page(
     if row_opt.is_none() {
         return error_page(
             &appstate,
-            error::Error::NoteNotFound(NoteNotFoundContext::InvalidData).to_string(),
+            Error::NoteNotFound(NoteNotFoundContext::InvalidData).to_string(),
         )
         .await
         .map(|h| h.into_response());
@@ -1190,13 +1186,13 @@ async fn deny_tag(
     let deck_id = match get_deck_by_tag_id(&appstate, tag_id).await {
         Ok(deck_id) => deck_id,
         Err(error) => {
-            tracing::warn!(error = %error, tag_id = tag_id, "Failed to get deck by tag ID");
+            warn!(error = %error, tag_id = tag_id, "Failed to get deck by tag ID");
             return Err(error);
         }
     };
 
     if !access_check(&appstate, deck_id, &user).await? {
-        return Err(error::Error::Unauthorized);
+        return Err(Error::Unauthorized);
     }
 
     let mut client = database::client(&appstate).await?; // needs mutable for transaction
@@ -1207,7 +1203,7 @@ async fn deny_tag(
             Ok(Redirect::to(&format!("/review/{res}")))
         }
         Err(error) => {
-            tracing::warn!(error = %error, tag_id = tag_id, "Failed to deny tag change");
+            warn!(error = %error, tag_id = tag_id, "Failed to deny tag change");
             let _ = tx.rollback().await;
             Err(error)
         }
@@ -1222,13 +1218,13 @@ async fn deny_note_move(
     let deck_id = match get_deck_by_move_id(&appstate, move_id).await {
         Ok(deck_id) => deck_id,
         Err(error) => {
-            tracing::warn!(error = %error, move_id = move_id, "Failed to get deck by move ID");
+            warn!(error = %error, move_id = move_id, "Failed to get deck by move ID");
             return Err(error);
         }
     };
 
     if !access_check(&appstate, deck_id, &user).await? {
-        return Err(error::Error::Unauthorized);
+        return Err(Error::Unauthorized);
     }
 
     let mut client = database::client(&appstate).await?;
@@ -1239,7 +1235,7 @@ async fn deny_note_move(
             Ok(Redirect::to(&format!("/review/{res}")))
         }
         Err(error) => {
-            tracing::warn!(error = %error, move_id = move_id, "Failed to deny note move request");
+            warn!(error = %error, move_id = move_id, "Failed to deny note move request");
             let _ = tx.rollback().await;
             Err(error)
         }
@@ -1254,24 +1250,24 @@ async fn accept_note_move(
     let deck_id = match get_deck_by_move_id(&appstate, move_id).await {
         Ok(deck_id) => deck_id,
         Err(error) => {
-            tracing::warn!(error = %error, move_id = move_id, "Failed to get deck by move ID");
+            warn!(error = %error, move_id = move_id, "Failed to get deck by move ID");
             return Err(error);
         }
     };
 
     if !access_check(&appstate, deck_id, &user).await? {
-        return Err(error::Error::Unauthorized);
+        return Err(Error::Unauthorized);
     }
 
     let mut client = database::client(&appstate).await?;
     let tx = client.transaction().await?;
-    match suggestion_manager::approve_move_note_request_by_moveid(&tx, move_id, user.id()).await {
+    match suggestion_manager::approve_move_note_request_by_move_id(&tx, move_id, user.id()).await {
         Ok(res) => {
             tx.commit().await?;
             Ok(Redirect::to(&format!("/review/{res}")))
         }
         Err(error) => {
-            tracing::warn!(error = %error, move_id = move_id, "Failed to accept note move request");
+            warn!(error = %error, move_id = move_id, "Failed to accept note move request");
             let _ = tx.rollback().await;
             Err(error)
         }
@@ -1286,13 +1282,13 @@ async fn accept_tag(
     let deck_id = match get_deck_by_tag_id(&appstate, tag_id).await {
         Ok(deck_id) => deck_id,
         Err(error) => {
-            tracing::warn!(error = %error, tag_id = tag_id, "Failed to get deck by tag ID");
+            warn!(error = %error, tag_id = tag_id, "Failed to get deck by tag ID");
             return Err(error);
         }
     };
 
     if !access_check(&appstate, deck_id, &user).await? {
-        return Err(error::Error::Unauthorized);
+        return Err(Error::Unauthorized);
     }
 
     let mut client = database::client(&appstate).await?;
@@ -1303,7 +1299,7 @@ async fn accept_tag(
             Ok(Redirect::to(&format!("/review/{res}")))
         }
         Err(error) => {
-            tracing::warn!(error = %error, tag_id = tag_id, "Failed to approve tag change");
+            warn!(error = %error, tag_id = tag_id, "Failed to approve tag change");
             let _ = tx.rollback().await;
             Err(error)
         }
@@ -1318,13 +1314,13 @@ async fn deny_field(
     let deck_id = match get_deck_by_field_id(&appstate, field_id).await {
         Ok(deck_id) => deck_id,
         Err(error) => {
-            tracing::warn!(error = %error, field_id = field_id, "Failed to get deck by field ID");
+            warn!(error = %error, field_id = field_id, "Failed to get deck by field ID");
             return Err(error);
         }
     };
 
     if !access_check(&appstate, deck_id, &user).await? {
-        return Err(error::Error::Unauthorized);
+        return Err(Error::Unauthorized);
     }
 
     let mut client = database::client(&appstate).await?;
@@ -1335,7 +1331,7 @@ async fn deny_field(
             Ok(Redirect::to(&format!("/review/{res}")))
         }
         Err(error) => {
-            tracing::warn!(error = %error, field_id = field_id, "Failed to deny field change");
+            warn!(error = %error, field_id = field_id, "Failed to deny field change");
             let _ = tx.rollback().await;
             Err(error)
         }
@@ -1350,13 +1346,13 @@ async fn accept_field(
     let deck_id = match get_deck_by_field_id(&appstate, field_id).await {
         Ok(deck_id) => deck_id,
         Err(error) => {
-            tracing::warn!(error = %error, field_id = field_id, "Failed to get deck by field ID");
+            warn!(error = %error, field_id = field_id, "Failed to get deck by field ID");
             return Err(error);
         }
     };
 
     if !access_check(&appstate, deck_id, &user).await? {
-        return Err(error::Error::Unauthorized);
+        return Err(Error::Unauthorized);
     }
 
     let mut client = database::client(&appstate).await?;
@@ -1375,14 +1371,14 @@ async fn accept_field(
                         )
                         .await
                     {
-                        tracing::warn!(error = ?e, note_id = nid, "Failed to update media references");
+                        warn!(error = ?e, note_id = nid, "Failed to update media references");
                     }
                 });
             }
             Ok(Redirect::to(&format!("/review/{res}")))
         }
         Err(error) => {
-            tracing::warn!(error = %error, field_id = field_id, "Failed to approve field change");
+            warn!(error = %error, field_id = field_id, "Failed to approve field change");
             let _ = tx.rollback().await;
             Err(error)
         }
@@ -1442,7 +1438,7 @@ async fn get_all_fields_for_edit(
             &[&note_id],
         )
         .await?;
-    
+
     let deck_id: i64 = match deck_row {
         Some(row) => row.get(0),
         None => {
@@ -1451,14 +1447,14 @@ async fn get_all_fields_for_edit(
             })));
         }
     };
-    
+
     // Check user has access to this deck
     if !access_check(&appstate, deck_id, &user).await? {
         return Ok(Json(serde_json::json!({
             "error": "Unauthorized"
         })));
     }
-    
+
     // Verify the commit exists and is associated with a deck the user can access
     let commit_deck_row = client
         .query_opt(
@@ -1466,7 +1462,7 @@ async fn get_all_fields_for_edit(
             &[&commit_id],
         )
         .await?;
-    
+
     if commit_deck_row.is_none() {
         return Ok(Json(serde_json::json!({
             "error": "Commit not found"
@@ -1480,11 +1476,11 @@ async fn get_all_fields_for_edit(
             "error": "Unauthorized"
         })));
     }
-    
+
     match suggestion_manager::get_all_fields_for_edit(&appstate, note_id, commit_id).await {
         Ok(response) => Ok(Json(serde_json::json!(response))),
         Err(error) => {
-            tracing::warn!(error = %error, note_id = note_id, commit_id = commit_id, "Failed to get all fields for edit");
+            warn!(error = %error, note_id = note_id, commit_id = commit_id, "Failed to get all fields for edit");
             Ok(Json(serde_json::json!({
                 "error": format!("{}", error)
             })))
@@ -1507,7 +1503,7 @@ async fn batch_update_field_suggestions(
             &[&payload.note_id],
         )
         .await?;
-    
+
     let deck_id: i64 = match deck_row {
         Some(row) => row.get(0),
         None => {
@@ -1519,7 +1515,7 @@ async fn batch_update_field_suggestions(
             }));
         }
     };
-    
+
     // Check user has access to this deck
     if !access_check(&appstate, deck_id, &user).await? {
         return Ok(Json(structs::BatchFieldSuggestionResponse {
@@ -1529,7 +1525,7 @@ async fn batch_update_field_suggestions(
             fields: vec![],
         }));
     }
-    
+
     // Verify the commit exists
     let commit_exists = client
         .query_opt(
@@ -1538,7 +1534,7 @@ async fn batch_update_field_suggestions(
         )
         .await?
         .is_some();
-    
+
     if !commit_exists {
         return Ok(Json(structs::BatchFieldSuggestionResponse {
             success: false,
@@ -1547,11 +1543,11 @@ async fn batch_update_field_suggestions(
             fields: vec![],
         }));
     }
-    
+
     let ip_str = client_ip.to_string();
     let mut db_client = database::client(&appstate).await?;
     let tx = db_client.transaction().await?;
-    
+
     match suggestion_manager::batch_create_or_update_field_suggestions(
         &tx,
         payload.note_id,
@@ -1567,17 +1563,17 @@ async fn batch_update_field_suggestions(
             let mut field_results: Vec<structs::FieldUpdateResult> = Vec::with_capacity(results.len());
             let mut updated_count = 0;
             let mut created_count = 0;
-            
+
             for result in results {
                 match result.action.as_str() {
                     "updated" => updated_count += 1,
                     "created" => created_count += 1,
                     _ => {}
                 }
-                
+
                 // Compute diff against the actual reviewed/published content
                 let diff_html = htmldiff::htmldiff(&result.reviewed_content, &result.new_content);
-                
+
                 field_results.push(structs::FieldUpdateResult {
                     position: result.position,
                     field_id: result.field_id,
@@ -1585,9 +1581,9 @@ async fn batch_update_field_suggestions(
                     diff_html,
                 });
             }
-            
+
             tx.commit().await?;
-            
+
             // Update media references asynchronously
             let note_id = payload.note_id;
             let state_clone = appstate.clone();
@@ -1598,10 +1594,10 @@ async fn batch_update_field_suggestions(
                 )
                 .await
                 {
-                    tracing::warn!(error = ?e, note_id = note_id, "Failed to update media references for note");
+                    warn!(error = ?e, note_id = note_id, "Failed to update media references for note");
                 }
             });
-            
+
             Ok(Json(structs::BatchFieldSuggestionResponse {
                 success: true,
                 updated_count,
@@ -1610,7 +1606,7 @@ async fn batch_update_field_suggestions(
             }))
         }
         Err(error) => {
-            tracing::warn!(error = %error, note_id = payload.note_id, "Failed to batch update field suggestions");
+            warn!(error = %error, note_id = payload.note_id, "Failed to batch update field suggestions");
             let _ = tx.rollback().await;
             Ok(Json(structs::BatchFieldSuggestionResponse {
                 success: false,
@@ -1686,7 +1682,7 @@ async fn add_tag_suggestion(
             }))
         }
         Err(error) => {
-            tracing::warn!(error = %error, note_id = payload.note_id, "Failed to add tag suggestion");
+            warn!(error = %error, note_id = payload.note_id, "Failed to add tag suggestion");
             let _ = tx.rollback().await;
             Ok(Json(structs::AddTagSuggestionResponse {
                 success: false,
@@ -1717,14 +1713,14 @@ async fn accept_note(
                         )
                         .await
                     {
-                        tracing::warn!(error = ?e, note_id = nid, "Failed to update media references");
+                        warn!(error = ?e, note_id = nid, "Failed to update media references");
                     }
                 });
             }
             Ok(Redirect::to(&format!("/review/{res}")))
         }
         Err(error) => {
-            tracing::warn!(error = %error, note_id = note_id, "Failed to approve note");
+            warn!(error = %error, note_id = note_id, "Failed to approve note");
             let _ = tx.rollback().await;
             Err(error)
         }
@@ -1740,7 +1736,7 @@ async fn deny_note(
     match suggestion_manager::delete_card(&appstate, note_id, user).await {
         Ok(res) => Ok(Redirect::to(&format!("/notes/{res}"))),
         Err(error) => {
-            tracing::warn!(error = %error, note_id = note_id, "Failed to delete note");
+            warn!(error = %error, note_id = note_id, "Failed to delete note");
             Err(error)
         }
     }
@@ -1765,14 +1761,14 @@ async fn remove_note_from_deck(
                         media_reference_manager::cleanup_media_for_denied_note(&state_clone, nid)
                             .await
                     {
-                        tracing::warn!(error = ?e, note_id = nid, "Failed to cleanup media references");
+                        warn!(error = ?e, note_id = nid, "Failed to cleanup media references");
                     }
                 });
             }
             Ok(Redirect::to(&format!("/notes/{res}")))
         }
         Err(error) => {
-            tracing::warn!(error = %error, note_id = note_id, "Failed to mark note as deleted");
+            warn!(error = %error, note_id = note_id, "Failed to mark note as deleted");
             let _ = tx.rollback().await;
             Err(error)
         }
@@ -1787,9 +1783,9 @@ async fn deny_note_removal(
     match note_manager::deny_note_removal_request(&appstate, note_id, user).await {
         Ok(res) => Ok(Redirect::to(&format!("/review/{res}"))),
         Err(error) => {
-            tracing::warn!(error = %error, note_id = note_id, "Failed to deny note removal request");
+            warn!(error = %error, note_id = note_id, "Failed to deny note removal request");
             // Convert Box<dyn Error> to our Error type
-            Err(error::Error::Unknown)
+            Err(Error::Unknown)
         }
     }
 }
@@ -1797,7 +1793,7 @@ async fn deny_note_removal(
 use once_cell::sync::Lazy;
 
 static STATS_CACHE_KEY: Lazy<String> =
-    Lazy::new(|| std::env::var("STATS_CACHE_KEY").expect("STATS_CACHE_KEY must be set"));
+    Lazy::new(|| env::var("STATS_CACHE_KEY").expect("STATS_CACHE_KEY must be set"));
 
 async fn refresh_stats_cache(
     State(appstate): State<Arc<AppState>>,
@@ -1869,7 +1865,7 @@ async fn show_statistics(
     let deck_base_info = match stats_manager::get_base_deck_info(&appstate, &deck_hash).await {
         Ok(deck_base_info) => deck_base_info,
         Err(error) => {
-            tracing::warn!(error = %error, "Failed to get base deck info for statistics");
+            warn!(error = %error, "Failed to get base deck info for statistics");
             return Ok(Html("Error showing the statistics.".to_string()));
         }
     };
@@ -1885,7 +1881,7 @@ async fn show_statistics(
     let deck_info = match stats_manager::get_deck_stat_info(&appstate, &deck_hash).await {
         Ok(deck_info) => deck_info,
         Err(error) => {
-            tracing::warn!(error = %error, "Failed to get deck stat info");
+            warn!(error = %error, "Failed to get deck stat info");
             return Ok(Html("Error showing the statistics.".to_string()));
         }
     };
@@ -1893,7 +1889,7 @@ async fn show_statistics(
     let notes_info = match stats_manager::get_worst_notes_info(&appstate, &deck_hash).await {
         Ok(notes_info) => notes_info,
         Err(error) => {
-            tracing::warn!(error = %error, "Failed to get worst notes info");
+            warn!(error = %error, "Failed to get worst notes info");
             return Ok(Html("Error showing the statistics.".to_string()));
         }
     };
@@ -1930,7 +1926,7 @@ async fn get_notes_from_deck(
     let client = database::client(&appstate).await?;
     let deck_info = client.query("Select id, name, description, human_hash, owner, TO_CHAR(last_update, 'MM/DD/YYYY') AS last_update from decks where human_hash = $1 Limit 1", &[&deck_hash]).await.expect("Error preparing deck notes statement");
     if deck_info.is_empty() {
-        return error_page(&appstate, error::Error::DeckNotFound.to_string())
+        return error_page(&appstate, Error::DeckNotFound.to_string())
             .await
             .map(|h| h.into_response());
     }
@@ -1988,7 +1984,7 @@ async fn all_reviews(
     let commits = match commit_manager::commits_review(&appstate, user.id()).await {
         Ok(commits) => commits,
         Err(error) => {
-            tracing::warn!(error = %error, "Failed to get commits for review");
+            warn!(error = %error, "Failed to get commits for review");
             return Ok(Html("Error getting the reviews.".to_string()));
         }
     };
@@ -2087,7 +2083,7 @@ async fn resolve_deck_id_by_hash(appstate: &Arc<AppState>, hash: &str) -> Return
 async fn api_get_subscription_policy(
     State(appstate): State<Arc<AppState>>,
     user: User,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<impl IntoResponse, Error> {
     let sub_hash = params
         .get("subscriber_deck_hash")
@@ -2176,7 +2172,7 @@ async fn api_post_subscription_policy(
                     .await?;
                 let mut valid_positions: Vec<i32> =
                     field_rows.iter().map(|r| r.get::<_, i32>(0)).collect();
-                let protected_set: std::collections::HashSet<i32> = field_rows
+                let protected_set: HashSet<i32> = field_rows
                     .iter()
                     .filter_map(|r| {
                         let pos: i32 = r.get(0);
@@ -2224,7 +2220,7 @@ async fn page_subscription_policy(
     // Authorization: must be owner/maintainer of subscriber deck
     let sub_id = resolve_deck_id_by_hash(&appstate, &subscriber_hash).await?;
     if sub_id == 0 || !access_check(&appstate, sub_id, &user).await? {
-        return error_page(&appstate, error::Error::Unauthorized.to_string())
+        return error_page(&appstate, Error::Unauthorized.to_string())
             .await
             .map(IntoResponse::into_response);
     }
@@ -2292,7 +2288,7 @@ async fn page_subscription_policy(
     context.insert("base_hash", &base_hash);
     context.insert(
         "notetypes",
-        &serde_json::to_string(&notetypes_meta).unwrap(),
+        &serde_json::to_string(&notetypes_meta)?,
     );
     let rendered_template = appstate.tera.render("subscription_policy.html", &context)?;
     Ok(Html(rendered_template).into_response())
@@ -2353,7 +2349,7 @@ async fn manage_decks(
     let notetypes = match notetype_manager::get_notetype_overview(&appstate, &user).await {
         Ok(cl) => cl,
         Err(error) => {
-            tracing::warn!(error = %error, "Failed to get notetype overview");
+            warn!(error = %error, "Failed to get notetype overview");
             return Ok(Html("Error managing your decks.".to_string()));
         }
     };
@@ -2413,6 +2409,7 @@ async fn set_static_cache_control(request: axum::extract::Request, next: Next) -
 
 use crate::error::Reporter;
 use sentry::integrations::tracing::EventFilter;
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() {
@@ -2425,7 +2422,7 @@ async fn main() {
         Ok(t) => t,
         Err(e) => {
             eprintln!("FATAL: Template parsing error(s): {e}");
-            ::std::process::exit(1);
+            std::process::exit(1);
         }
     };
     tera.autoescape_on(vec![".html", ".sql", ".htm", ".xml"]);
@@ -2434,10 +2431,10 @@ async fn main() {
         .await
         .expect("Failed to establish database connection pool");
 
-    let s3_access_key_id = std::env::var("S3_ACCESS_KEY_ID").expect("S3_ACCESS_KEY_ID must be set");
+    let s3_access_key_id = env::var("S3_ACCESS_KEY_ID").expect("S3_ACCESS_KEY_ID must be set");
     let s3_secret_access_key =
-        std::env::var("S3_SECRET_ACCESS_KEY").expect("S3_SECRET_ACCESS_KEY must be set");
-    let s3_domain = std::env::var("S3_DOMAIN").expect("S3_DOMAIN must be set");
+        env::var("S3_SECRET_ACCESS_KEY").expect("S3_SECRET_ACCESS_KEY must be set");
+    let s3_domain = env::var("S3_DOMAIN").expect("S3_DOMAIN must be set");
 
     let credentials = aws_sdk_s3::config::Credentials::new(
         s3_access_key_id,
@@ -2465,7 +2462,7 @@ async fn main() {
     let s3_client = S3Client::from_conf(s3_service_config);
 
     // Initialize media token service
-    let media_token_secret = std::env::var("MEDIA_TOKEN_SECRET")
+    let media_token_secret = env::var("MEDIA_TOKEN_SECRET")
         .expect("MEDIA_TOKEN_SECRET must be set");
     let media_token_service = media_tokens::MediaTokenService::new(
         media_token_secret.into_bytes(),
@@ -2473,7 +2470,7 @@ async fn main() {
     )
     .expect("Failed to initialize media token service");
 
-    let state = Arc::new(database::AppState {
+    let state = Arc::new(AppState {
         db_pool: Arc::new(pool),
         tera: Arc::new(tera),
         s3_client,
@@ -2546,7 +2543,7 @@ async fn main() {
     // Spawn connection handling
     tokio::spawn(async move {
         if let Err(e) = connection.await {
-            tracing::error!(error = %e, "Database connection error");
+            error!(error = %e, "Database connection error");
         }
     });
     let db = Arc::new(client);
@@ -2579,7 +2576,7 @@ async fn main() {
         // .route("/MediaManager", post(post_media_manager))
         .route("/EditNotetype/{notetype_id}", get(edit_notetype))
         .route(
-            "/EditNotetype", 
+            "/EditNotetype",
             post(post_edit_notetype)
                 .layer(axum::extract::DefaultBodyLimit::max(5 * 1024 * 1024)) // 5MB limit for notetype updates (to allow large CSS/templates
         )
@@ -2660,7 +2657,7 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind("localhost:1337")
         .await
         .unwrap();
-    tracing::info!("Server listening on {}", listener.local_addr().unwrap());
+    info!("Server listening on {}", listener.local_addr().unwrap());
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),

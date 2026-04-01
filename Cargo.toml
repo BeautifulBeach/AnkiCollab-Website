@@ -40,10 +40,11 @@ aws-config = { version = "1.8.15", features = ["behavior-version-latest"] }
 aws-sdk-s3 = { version = "1.125.0", features = ["behavior-version-latest"] }
 governor = "0.10.4"
 tower_governor = { version = "0.8.0", features = ["axum"] }
-htmldiff = { path = "./htmldiff" }
+htmldiff = "0.1.0"
 axum-client-ip = "1.3.1"
 clap = { version = "4.5.60", features = ["derive"] }
+sqlx = { version = "0.8.6", features = ["postgres", "ipnet", "runtime-tokio-rustls"] }
 
-[[bin]]
-name = "changelog_export"
-path = "src/bin/changelog_export.rs"
+#[[bin]]
+#name = "changelog_export"
+#path = "src/bin/changelog_export.rs"

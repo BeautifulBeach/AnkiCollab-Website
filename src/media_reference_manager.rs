@@ -239,7 +239,7 @@ pub async fn get_presigned_url(
     };
 
     let clean_filename = crate::cleanser::clean(filename);
-    
+
     // Query to get hash and deck_hash in one go
     let query = "
         SELECT mf.hash, d.human_hash 
@@ -249,7 +249,7 @@ pub async fn get_presigned_url(
         JOIN decks d ON d.id = n.deck
         WHERE mr.file_name = $1 AND mr.note_id = $2
     ";
-    
+
     let row = client
         .query_one(query, &[&clean_filename, &note_id])
         .await?;
@@ -270,12 +270,11 @@ pub async fn get_presigned_url(
         .generate_download_token(token_params)
         .map_err(|err| format!("Failed to generate download token: {err}"))?;
 
-    // Get media proxy URL from environment
-    let media_proxy_url = std::env::var("MEDIA_PROXY_URL")
-        .unwrap_or_else(|_| "https://media.ankicollab.com".to_string());
-
     // Construct proxy URL
-    let proxy_url = format!("{}/v1/media/{}?token={}", media_proxy_url, hash, token);
+    let proxy_url = format!(
+        "{}/v1/media/{}?token={}",
+        state.server_config.media_proxy_url, hash, token
+    );
 
     Ok(proxy_url)
 }

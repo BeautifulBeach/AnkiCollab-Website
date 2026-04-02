@@ -9,15 +9,16 @@ pub mod gdrive_manager;
 pub mod maintainer_manager;
 pub mod media_reference_manager;
 pub mod media_tokens;
-pub mod notification_manager;
 pub mod note_history;
 pub mod note_manager;
 pub mod notetype_manager;
+pub mod notification_manager;
 pub mod optional_tags_manager;
 pub mod stats_manager;
 pub mod structs;
 pub mod suggestion_manager;
 pub mod user;
+pub mod utils;
 
 use crate::error::Error;
 use crate::error::NoteNotFoundContext;
@@ -35,18 +36,14 @@ use database::owned_deck_id;
 use database::AppState;
 use net::SocketAddr;
 use serde::{Deserialize, Serialize};
+use std::fmt::format;
 use std::result::Result;
-use std::{
-    cfg, env, eprintln, format, net, option_env, panic, str, sync,
-    unreachable, vec,
-};
+use std::{cfg, env, eprintln, format, net, option_env, panic, str, sync, unreachable, vec};
 use structs::{
     BasicDeckInfo, DeckHash, DeckId, DeckOverview, FieldId, NoteId, Return, UpdateNotetype,
     UpdateNotetypeTemplate, UserId,
 };
-use structs::{
-    BulkNoteActionFailure, BulkNoteActionRequest, BulkNoteActionResponse,
-};
+use structs::{BulkNoteActionFailure, BulkNoteActionRequest, BulkNoteActionResponse};
 use structs::{
     CommitDecisionRequest, NotificationHistoryResponse, NotificationMarkReadRequest,
     NotificationMarkReadResponse, NotificationUnreadResponse,
@@ -63,7 +60,10 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use user::{purge_deleted_account_data, Auth, ChangePasswordRequest, Credentials, User};
 
-type SharedConn = bb8_postgres::bb8::PooledConnection<'static, bb8_postgres::PostgresConnectionManager<tokio_postgres::NoTls>>;
+type SharedConn = bb8_postgres::bb8::PooledConnection<
+    'static,
+    bb8_postgres::PostgresConnectionManager<tokio_postgres::NoTls>,
+>;
 
 fn check_login(user: Option<User>) -> Result<User, Error> {
     match user {
@@ -89,10 +89,9 @@ async fn post_login(
     let res = auth.login(form, ip).await?;
 
     let mut response = Redirect::to("/").into_response();
-    response.headers_mut().insert(
-        header::SET_COOKIE,
-        HeaderValue::from_str(&res).unwrap(),
-    );
+    response
+        .headers_mut()
+        .insert(header::SET_COOKIE, HeaderValue::from_str(&res).unwrap());
 
     Ok(response)
 }
@@ -154,9 +153,13 @@ async fn datenschutz(State(appstate): State<Arc<AppState>>) -> Result<impl IntoR
     Ok(Html(rendered_template))
 }
 
-async fn accessibility_page(State(appstate): State<Arc<AppState>>) -> Result<impl IntoResponse, Error> {
+async fn accessibility_page(
+    State(appstate): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, Error> {
     let context = tera::Context::new();
-    let rendered_template = appstate.tera.render("accessibility_statement.html", &context)?;
+    let rendered_template = appstate
+        .tera
+        .render("accessibility_statement.html", &context)?;
     Ok(Html(rendered_template))
 }
 
@@ -590,22 +593,23 @@ async fn delete_deck(
     let db_state_clone = Arc::clone(&appstate);
 
     let client: SharedConn = match db_state_clone.db_pool.get_owned().await {
-            Ok(pool) => pool,
-            Err(err) => {
-                error!(error = %err, "Failed to get database connection pool");
-                return Err(Error::DatabaseConnection);
-            }
-        };
+        Ok(pool) => pool,
+        Err(err) => {
+            error!(error = %err, "Failed to get database connection pool");
+            return Err(Error::DatabaseConnection);
+        }
+    };
     let _ = owned_deck_id(&appstate, &deck_hash, user.id()).await?; // only for checking if user owns the deck
 
     client
         .query("Select delete_deck($1)", &[&deck_hash])
         .await?;
 
-
     // Run on the Tokio runtime
     tokio::spawn(async move {
-        if let Err(e) = purge_s3_deck_assets(&db_state_clone, &deck_hash).await {
+        if let Err(e) =
+            purge_s3_deck_assets(&db_state_clone, &deck_hash, &appstate.server_config).await
+        {
             warn!(error = %e, deck_hash = %deck_hash, "Failed to purge S3 assets for deck");
         }
 
@@ -622,9 +626,11 @@ async fn delete_deck(
                 "DELETE FROM notetype WHERE id NOT IN (SELECT DISTINCT notetype FROM notes)",
                 &[],
             )
-            .await.unwrap();
+            .await
+            .unwrap();
 
-        if let Err(err) = purge_s3_deck_assets(&appstate, &deck_hash).await {
+        if let Err(err) = purge_s3_deck_assets(&appstate, &deck_hash, &appstate.server_config).await
+        {
             warn!(
                 error = %err,
                 deck_hash = %deck_hash,
@@ -640,12 +646,8 @@ async fn delete_deck(
 async fn purge_s3_deck_assets(
     appstate: &Arc<AppState>,
     deck_hash: &str,
+    server_config: &ServerConfig,
 ) -> Result<(), aws_sdk_s3::Error> {
-    let bucket = match env::var("S3_MEDIA_BUCKET") {
-        Ok(bucket) if !bucket.trim().is_empty() => bucket.trim().to_owned(),
-        _ => return Ok(()),
-    };
-
     let prefix = format!("decks/{deck_hash}/");
     let client = &appstate.s3_client;
     let mut continuation_token: Option<String> = None;
@@ -653,7 +655,7 @@ async fn purge_s3_deck_assets(
     loop {
         let mut request = client
             .list_objects_v2()
-            .bucket(&bucket)
+            .bucket(&server_config.s3_media_bucket)
             .prefix(&prefix);
 
         if let Some(ref token) = continuation_token {
@@ -671,16 +673,14 @@ async fn purge_s3_deck_assets(
         for key in keys {
             client
                 .delete_object()
-                .bucket(&bucket)
+                .bucket(&server_config.s3_media_bucket)
                 .key(key)
                 .send()
                 .await?;
         }
 
         if response.is_truncated().unwrap_or(false) {
-            continuation_token = response
-                .next_continuation_token()
-                .map(ToOwned::to_owned);
+            continuation_token = response.next_continuation_token().map(ToOwned::to_owned);
         } else {
             break;
         }
@@ -689,7 +689,7 @@ async fn purge_s3_deck_assets(
     let marker_key = format!("decks/{deck_hash}");
     let _ = client
         .delete_object()
-        .bucket(&bucket)
+        .bucket(&server_config.s3_media_bucket)
         .key(marker_key)
         .send()
         .await;
@@ -787,7 +787,10 @@ async fn bulk_note_action(
                 succeeded: vec![],
                 failed: vec![BulkNoteActionFailure {
                     id: 0,
-                    reason: format!("Invalid action '{}'. Expected 'approve' or 'deny'.", payload.action),
+                    reason: format!(
+                        "Invalid action '{}'. Expected 'approve' or 'deny'.",
+                        payload.action
+                    ),
                 }],
             }));
         }
@@ -826,7 +829,10 @@ async fn bulk_note_action(
         .filter(|r| !r.success)
         .map(|r| BulkNoteActionFailure {
             id: r.note_id,
-            reason: r.reason.clone().unwrap_or_else(|| "Unknown error".to_string()),
+            reason: r
+                .reason
+                .clone()
+                .unwrap_or_else(|| "Unknown error".to_string()),
         })
         .collect();
 
@@ -939,13 +945,9 @@ async fn review_commit(
         _ => default_limit,
     };
 
-    let notes_page = commit_manager::notes_by_commit(
-        &appstate,
-        commit_id,
-        sanitized_offset,
-        sanitized_limit,
-    )
-    .await?;
+    let notes_page =
+        commit_manager::notes_by_commit(&appstate, commit_id, sanitized_offset, sanitized_limit)
+            .await?;
     let notes_loaded = notes_page.notes.len();
 
     let commit = commit_manager::get_commit_info(&appstate, commit_id).await?;
@@ -1560,7 +1562,8 @@ async fn batch_update_field_suggestions(
     {
         Ok(results) => {
             // Calculate diffs for each modified field
-            let mut field_results: Vec<structs::FieldUpdateResult> = Vec::with_capacity(results.len());
+            let mut field_results: Vec<structs::FieldUpdateResult> =
+                Vec::with_capacity(results.len());
             let mut updated_count = 0;
             let mut created_count = 0;
 
@@ -1790,16 +1793,11 @@ async fn deny_note_removal(
     }
 }
 
-use once_cell::sync::Lazy;
-
-static STATS_CACHE_KEY: Lazy<String> =
-    Lazy::new(|| env::var("STATS_CACHE_KEY").expect("STATS_CACHE_KEY must be set"));
-
 async fn refresh_stats_cache(
     State(appstate): State<Arc<AppState>>,
     Path(secret): Path<String>,
 ) -> Result<impl IntoResponse, Error> {
-    if secret != *STATS_CACHE_KEY {
+    if secret != *appstate.server_config.stats_cache_key {
         return Ok(Redirect::to("/"));
     }
     let db_state_clone = Arc::clone(&appstate);
@@ -2286,10 +2284,7 @@ async fn page_subscription_policy(
     context.insert("user", &user);
     context.insert("subscriber_hash", &subscriber_hash);
     context.insert("base_hash", &base_hash);
-    context.insert(
-        "notetypes",
-        &serde_json::to_string(&notetypes_meta)?,
-    );
+    context.insert("notetypes", &serde_json::to_string(&notetypes_meta)?);
     let rendered_template = appstate.tera.render("subscription_policy.html", &context)?;
     Ok(Html(rendered_template).into_response())
 }
@@ -2384,13 +2379,17 @@ async fn get_presigned_url(
     if parsed_nid == 0 {
         return Ok(Json(response));
     }
-    let presigned_url =
-        match media_reference_manager::get_presigned_url(&appstate, &data.filename, parsed_nid, user.id())
-            .await
-        {
-            Ok(presigned_url) => presigned_url,
-            Err(_error) => return Ok(Json(response)),
-        };
+    let presigned_url = match media_reference_manager::get_presigned_url(
+        &appstate,
+        &data.filename,
+        parsed_nid,
+        user.id(),
+    )
+    .await
+    {
+        Ok(presigned_url) => presigned_url,
+        Err(_error) => return Ok(Json(response)),
+    };
 
     response.success = true;
     response.presigned_url = presigned_url;
@@ -2408,6 +2407,7 @@ async fn set_static_cache_control(request: axum::extract::Request, next: Next) -
 }
 
 use crate::error::Reporter;
+use crate::utils::server_config::ServerConfig;
 use sentry::integrations::tracing::EventFilter;
 use tracing::{error, info, warn};
 
@@ -2416,66 +2416,6 @@ async fn main() {
     dotenvy::dotenv().expect(
         "Expected .env file in the root directory containing the database connection string",
     );
-    let _reporter = Reporter::new();
-
-    let mut tera = match Tera::new("src/templates/**/*.html") {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("FATAL: Template parsing error(s): {e}");
-            std::process::exit(1);
-        }
-    };
-    tera.autoescape_on(vec![".html", ".sql", ".htm", ".xml"]);
-
-    let pool = database::establish_pool_connection()
-        .await
-        .expect("Failed to establish database connection pool");
-
-    let s3_access_key_id = env::var("S3_ACCESS_KEY_ID").expect("S3_ACCESS_KEY_ID must be set");
-    let s3_secret_access_key =
-        env::var("S3_SECRET_ACCESS_KEY").expect("S3_SECRET_ACCESS_KEY must be set");
-    let s3_domain = env::var("S3_DOMAIN").expect("S3_DOMAIN must be set");
-
-    let credentials = aws_sdk_s3::config::Credentials::new(
-        s3_access_key_id,
-        s3_secret_access_key,
-        None,
-        None,
-        "s3-credentials",
-    );
-
-    let region_provider =
-        aws_config::meta::region::RegionProviderChain::default_provider().or_else("eu-central-1"); // Europe (Frankfurt)
-    let s3_config = aws_config::from_env()
-        .region(region_provider)
-        .credentials_provider(aws_sdk_s3::config::SharedCredentialsProvider::new(
-            credentials,
-        ))
-        .endpoint_url(&s3_domain)
-        .load()
-        .await;
-
-    let s3_service_config = aws_sdk_s3::config::Builder::from(&s3_config)
-        .force_path_style(true) // Contabo is <special>
-        .build();
-
-    let s3_client = S3Client::from_conf(s3_service_config);
-
-    // Initialize media token service
-    let media_token_secret = env::var("MEDIA_TOKEN_SECRET")
-        .expect("MEDIA_TOKEN_SECRET must be set");
-    let media_token_service = media_tokens::MediaTokenService::new(
-        media_token_secret.into_bytes(),
-        std::time::Duration::from_secs(5 * 60), // 5 minutes
-    )
-    .expect("Failed to initialize media token service");
-
-    let state = Arc::new(AppState {
-        db_pool: Arc::new(pool),
-        tera: Arc::new(tera),
-        s3_client,
-        media_token_service,
-    });
 
     // Enable tracing.
     let env_filter = if cfg!(debug_assertions) {
@@ -2517,6 +2457,54 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer().without_time())
         .init();
 
+    let _reporter = Reporter::new();
+    let server_config = ServerConfig::new().await;
+
+    let mut tera = match Tera::new("src/templates/**/*.html") {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("FATAL: Template parsing error(s): {e}");
+            std::process::exit(1);
+        }
+    };
+    tera.autoescape_on(vec![".html", ".sql", ".htm", ".xml"]);
+
+    let pool = database::establish_pool_connection(&server_config.database_url)
+        .await
+        .expect("Failed to establish database connection pool");
+
+    let credentials = aws_sdk_s3::config::Credentials::new(
+        &server_config.s3_access_key_id,
+        &server_config.s3_secret_access_key,
+        None,
+        None,
+        "s3-credentials",
+    );
+
+    let region_provider =
+        aws_config::meta::region::RegionProviderChain::default_provider().or_else("eu-central-1"); // Europe (Frankfurt)
+    let s3_config = aws_config::from_env()
+        .region(region_provider)
+        .credentials_provider(aws_sdk_s3::config::SharedCredentialsProvider::new(
+            credentials,
+        ))
+        .endpoint_url(&server_config.s3_domain)
+        .load()
+        .await;
+
+    let s3_service_config = aws_sdk_s3::config::Builder::from(&s3_config)
+        .force_path_style(true) // Contabo is <special>
+        .build();
+
+    let s3_client = S3Client::from_conf(s3_service_config);
+
+    // Initialize media token service
+    let media_token_service = media_tokens::MediaTokenService::new(
+        server_config.media_token_secret.clone().into_bytes(),
+        std::time::Duration::from_secs(5 * 60), // 5 minutes
+    )
+    .expect("Failed to initialize media token service");
+
     // let governor_conf = Arc::new(
     //     GovernorConfigBuilder::default()
     //         .finish()
@@ -2534,12 +2522,10 @@ async fn main() {
     // });
 
     // Second db connection for the auth. idk.. should prolly use the pool for this too
-    let (client, connection) = tokio_postgres::connect(
-        &env::var("DATABASE_URL").expect("DATABASE_URL must be set"),
-        tokio_postgres::NoTls,
-    )
-    .await
-    .expect("Failed to connect to database");
+    let (client, connection) =
+        tokio_postgres::connect(&server_config.database_url, tokio_postgres::NoTls)
+            .await
+            .expect("Failed to connect to database");
     // Spawn connection handling
     tokio::spawn(async move {
         if let Err(e) = connection.await {
@@ -2548,12 +2534,20 @@ async fn main() {
     });
     let db = Arc::new(client);
     // Create Auth instance
-    let jwt_secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
     let auth = Arc::new(Auth::new(
         db.clone(),
-        jwt_secret,
-        env::var("COOKIE_SECURE").unwrap_or("false".to_string()) == "true",
+        server_config.jwt_secret.clone(),
+        server_config.cookie_secure,
     ));
+
+    let port_clone = server_config.port.clone();
+    let state = Arc::new(AppState {
+        db_pool: Arc::new(pool),
+        tera: Arc::new(tera),
+        s3_client,
+        media_token_service,
+        server_config,
+    });
 
     let app = Router::new()
         .route("/login", get(get_login).post(post_login))
@@ -2577,8 +2571,7 @@ async fn main() {
         .route("/EditNotetype/{notetype_id}", get(edit_notetype))
         .route(
             "/EditNotetype",
-            post(post_edit_notetype)
-                .layer(axum::extract::DefaultBodyLimit::max(5 * 1024 * 1024)) // 5MB limit for notetype updates (to allow large CSS/templates
+            post(post_edit_notetype).layer(axum::extract::DefaultBodyLimit::max(5 * 1024 * 1024)), // 5MB limit for notetype updates (to allow large CSS/templates
         )
         .route("/EditDeck/{deck_hash}", get(edit_deck))
         .route("/EditDeck", post(post_edit_deck))
@@ -2609,8 +2602,14 @@ async fn main() {
         .route("/DenyField/{field_id}", post(deny_field))
         .route("/AcceptField/{field_id}", post(accept_field))
         //.route("/UpdateFieldSuggestion", post(update_field))
-        .route("/GetAllFieldsForEdit/{note_id}/{commit_id}", get(get_all_fields_for_edit))
-        .route("/BatchUpdateFieldSuggestions", post(batch_update_field_suggestions))
+        .route(
+            "/GetAllFieldsForEdit/{note_id}/{commit_id}",
+            get(get_all_fields_for_edit),
+        )
+        .route(
+            "/BatchUpdateFieldSuggestions",
+            post(batch_update_field_suggestions),
+        )
         .route("/AddTagSuggestion", post(add_tag_suggestion))
         .route("/DenyCommit/{commit_id}", post(deny_commit))
         .route("/ApproveCommit/{commit_id}", post(approve_commit))
@@ -2651,10 +2650,10 @@ async fn main() {
         .with_state(state)
         .layer(Extension(auth))
         .layer(ClientIpSource::CfConnectingIp.into_extension());
-        //.layer(ClientIpSource::ConnectInfo.into_extension());
+    //.layer(ClientIpSource::ConnectInfo.into_extension());
 
     // run it
-    let listener = tokio::net::TcpListener::bind("localhost:1337")
+    let listener = tokio::net::TcpListener::bind(format!("localhost:{}", port_clone))
         .await
         .unwrap();
     info!("Server listening on {}", listener.local_addr().unwrap());

@@ -75,7 +75,7 @@ fn is_expected_client_error(message: &str) -> bool {
 
 impl Reporter {
     pub fn new() -> Self {
-        let endpoint = std::env::var("SENTRY_URL").unwrap();
+        let endpoint = std::env::var("SENTRY_URL").unwrap(); // TODO: Initialize with value from ServerConfig
         let before_send = Some(Arc::new(|mut event: Event<'static>| {
             // Drop expected client errors - these are properly handled, not bugs
             if event.message.as_ref().is_some_and(|m| is_expected_client_error(m)) {
